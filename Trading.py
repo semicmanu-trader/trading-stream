@@ -45,7 +45,9 @@ if 'status_log' not in st.session_state:
 if 'trade_plan_log' not in st.session_state:
     st.session_state.trade_plan_log = []
 
-exchange = ccxt.binance()
+exchange = ccxt.bybit({
+    'enableRateLimit': True,
+})
 
 # -----------------------------------------------------------------------------
 # 1. 데이터 가져오기 (KST 변환)
