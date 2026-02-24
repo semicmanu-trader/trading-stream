@@ -53,12 +53,14 @@ exchange = ccxt.binance()
 @st.cache_data(ttl=60)
 def fetch_ohlcv(symbol, timeframe, limit=1000):
     try:
+        # rateLimit 설정을 위해 exchange 정의를 함수 밖이나 안에서 보강할 수 있습니다.
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # KST 변환 (UTC+9)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=9)
         return df
-    except Exception:
+    except Exception as e:
+        # 웹 화면에 어떤 에러가 나는지 빨간 박스로 표시합니다.
+        st.error(f"📡 {symbol} {timeframe} 데이터 로드 실패: {e}")
         return pd.DataFrame()
 
 def calculate_indicators(df):
@@ -370,7 +372,7 @@ if isinstance(st.session_state.status_log, pd.DataFrame) and not st.session_stat
     # [Tab 0] Dashboard
     with tabs[0]:
         st.subheader("📋 All Signals Status")
-        st.dataframe(df_status.style.applymap(color_status, subset=['Status']), use_container_width=True)
+        st.dataframe(df_status.style.map(color_status, subset=['Status']), use_container_width=True)
     
     # [Tab 1~5] Individual Signals
     sig_names = ["Sig 1", "Sig 2", "Sig 3", "Sig 4", "Sig 5"]
@@ -385,7 +387,7 @@ if isinstance(st.session_state.status_log, pd.DataFrame) and not st.session_stat
                 st.caption("ℹ️ Breakout of 10-Candle High/Low (Valid 5 bars, Reset on new high, Invalid if 2 bars deviate)")
 
             df_sub = df_status[df_status['Signal'] == sig_name].sort_values(by='Status', ascending=True) 
-            st.dataframe(df_sub.style.applymap(color_status, subset=['Status']), use_container_width=True)
+            st.dataframe(df_status.style.map(color_status, subset=['Status']), use_container_width=True)
             
     # [Tab 6~] Multi Signals per Coin
     for i, coin in enumerate(COINS):
