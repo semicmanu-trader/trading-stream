@@ -35,38 +35,52 @@ if 'trade_plan_log' not in st.session_state:
     st.session_state.trade_plan_log = []
 
 # -----------------------------------------------------------------------------
-# 1. 데이터 가져오기 (yfinance - IP 차단 대응)
+# 1. 데이터 가져오기 (yfinance MultiIndex 버그 완벽 수정)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
 def fetch_ohlcv(symbol, timeframe):
     try:
         yf_symbol = COIN_MAP.get(symbol, 'BTC-USD')
         period = "2d" if timeframe == "15m" else "60d"
-        df = yf.download(tickers=yf_symbol, period=period, interval=timeframe, progress=False)
+        # 단일 티커에 대해서도 group_by='column'을 강제하여 데이터 구조를 고정
+        df = yf.download(tickers=yf_symbol, period=period, interval=timeframe, progress=False, group_by='column')
+        
         if df.empty: return pd.DataFrame()
+        
+        # [핵심 수정] MultiIndex 컬럼에서 해당 코인의 데이터만 정확히 추출
         if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+            # 만약 MultiIndex라면 (Price, Ticker) 또는 (Ticker, Price) 구조임
+            if yf_symbol in df.columns.get_level_values(0):
+                df = df[yf_symbol]
+            elif yf_symbol in df.columns.get_level_values(1):
+                df = df.xs(yf_symbol, axis=1, level=1)
+        
         df = df.reset_index()
         df.columns = [c.lower() for c in df.columns]
         df = df.rename(columns={'datetime': 'timestamp', 'date': 'timestamp'})
+        
+        # KST 변환
         df['timestamp'] = pd.to_datetime(df['timestamp']) + timedelta(hours=9)
         return df
-    except Exception:
+    except Exception as e:
         return pd.DataFrame()
 
 def calculate_indicators(df):
-    if df.empty or len(df) < 50: return df
+    if df.empty or len(df) < 35: return df
     try:
-        for col in ['open', 'high', 'low', 'close']:
-            df[col] = df[col].astype(float)
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        
+        # BB, CCI, ATR 등 지표 계산
         df['CCI_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
-        df['RSI_14'] = ta.rsi(df['close'], length=14)
+        df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         bb20 = ta.bbands(df['close'], length=20, std=2.0)
         if bb20 is not None:
-            df['BBL_20'], df['BBU_20'] = bb20.iloc[:, 0], bb20.iloc[:, 2]
+            df['BBL_20'] = bb20.iloc[:, 0]
+            df['BBU_20'] = bb20.iloc[:, 2]
         df['High_30'] = df['high'].rolling(30).max().shift(1)
         df['Low_30']  = df['low'].rolling(30).min().shift(1)
-        df['ATR_14'] = ta.atr(df['high'], df['low'], df['close'], length=14)
         return df
     except: return df
 
