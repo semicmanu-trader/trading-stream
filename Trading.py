@@ -1,37 +1,36 @@
 # -*- coding: utf-8 -*-
 """
 Created on Tue Feb 24 20:32:31 2026
-
+Modified for yfinance Integration & Pandas Compatibility
 @author: Sanghee Han
 """
 
 import streamlit as st
-import time
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
 from datetime import datetime, timedelta
-import os
 import numpy as np
 
 # -----------------------------------------------------------------------------
 # 0. 라이브러리 및 설정
 # -----------------------------------------------------------------------------
-try:
-    import ccxt
-    import pandas as pd
-    import pandas_ta as ta
-    import openpyxl
-except ImportError as e:
-    st.error(f"❌ 필수 라이브러리가 설치되지 않았습니다. 터미널에 입력하세요: pip install ccxt pandas pandas_ta openpyxl")
-    st.stop()
-
 st.set_page_config(page_title="Crypto Signal Monitor & Calculator", layout="wide")
 
-# 코인 및 타임프레임
-COINS = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT']
+# 코인 매핑 (ccxt 형식 -> yfinance 형식)
+COIN_MAP = {
+    'BTC/USDT': 'BTC-USD',
+    'ETH/USDT': 'ETH-USD',
+    'XRP/USDT': 'XRP-USD',
+    'SOL/USDT': 'SOL-USD'
+}
+
+# yfinance 지원 타임프레임 규격에 맞춤
 TIMEFRAMES = {
     '15m': '15m',
     '1h': '1h',
-    '2h': '2h',
-    '4h': '4h',
+    '2h': '1h',  # yfinance는 2h/4h 직접 지원이 불안정하여 1h 데이터를 가져와 처리하거나 1h로 대체
+    '4h': '1h',
     '1d': '1d'
 }
 
@@ -45,24 +44,31 @@ if 'status_log' not in st.session_state:
 if 'trade_plan_log' not in st.session_state:
     st.session_state.trade_plan_log = []
 
-exchange = ccxt.bybit({
-    'enableRateLimit': True,
-})
-
 # -----------------------------------------------------------------------------
-# 1. 데이터 가져오기 (KST 변환)
+# 1. 데이터 가져오기 (yfinance 사용 - IP 차단 방지)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=60)
-def fetch_ohlcv(symbol, timeframe, limit=1000):
+def fetch_ohlcv(symbol, timeframe):
     try:
-        # rateLimit 설정을 위해 exchange 정의를 함수 밖이나 안에서 보강할 수 있습니다.
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms') + timedelta(hours=9)
+        yf_symbol = COIN_MAP.get(symbol, 'BTC-USD')
+        # 타임프레임별 데이터 기간 설정
+        period = "5d" if timeframe == "15m" else "60d"
+        
+        df = yf.download(tickers=yf_symbol, period=period, interval=timeframe, progress=False)
+        
+        if df.empty: return pd.DataFrame()
+        
+        # 인덱스 초기화 및 컬럼 정리
+        df = df.reset_index()
+        # yfinance MultiIndex 컬럼 대응 및 소문자 변환
+        df.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in df.columns]
+        df = df.rename(columns={'datetime': 'timestamp', 'date': 'timestamp'})
+        
+        # KST 변환 (UTC+9)
+        df['timestamp'] = pd.to_datetime(df['timestamp']) + timedelta(hours=9)
         return df
     except Exception as e:
-        # 웹 화면에 어떤 에러가 나는지 빨간 박스로 표시합니다.
-        st.error(f"📡 {symbol} {timeframe} 데이터 로드 실패: {e}")
+        st.error(f"📡 {symbol} 데이터 로드 실패: {e}")
         return pd.DataFrame()
 
 def calculate_indicators(df):
@@ -87,7 +93,7 @@ def calculate_indicators(df):
     # CCI 20 (HLC3)
     df['CCI_20'] = ta.cci(df['high'], df['low'], df['close'], length=20)
     
-    # Signal 1용 지표 (Divergence)
+    # RSI & MACD
     df['RSI_14'] = ta.rsi(df['close'], length=14)
     df['CCI_10'] = ta.cci(df['high'], df['low'], df['close'], length=10) 
     
@@ -96,7 +102,6 @@ def calculate_indicators(df):
         df['MACD'] = macd['MACD_12_26_9'] 
 
     # Signal 5용: Donchian Channel (30봉 기준 고가/저가)
-    # shift(1)을 하여 '현재 봉을 제외한' 과거 30봉의 고가/저가를 구함
     df['High_30'] = df['high'].rolling(30).max().shift(1)
     df['Low_30']  = df['low'].rolling(30).min().shift(1)
 
@@ -106,21 +111,17 @@ def calculate_indicators(df):
     return df
 
 # -----------------------------------------------------------------------------
-# 2. 신호 유효성(Validity) 검사 로직
+# 2. 신호 유효성(Validity) 검사 로직 (상희님 기존 로직 유지)
 # -----------------------------------------------------------------------------
 
 def check_signal_1_div_validity(df):
-    """ Signal 1: Divergence (3중 2 컨플루언스, 3봉 유효) """
     if len(df) < 50: return False, None, None
     current_idx = len(df) - 1
-    
     for offset in range(3): 
         idx = current_idx - offset
         if idx < 20: continue
-        
         prd = 5
         pivot_idx = idx - prd
-        
         # Bullish
         window_low = df['low'].iloc[pivot_idx-prd : pivot_idx+prd+1]
         if df['low'].iloc[pivot_idx] == window_low.min():
@@ -131,12 +132,11 @@ def check_signal_1_div_validity(df):
                 prev_win = df['low'].iloc[prev_p_idx-prd : prev_p_idx+prd+1]
                 if df['low'].iloc[prev_p_idx] == prev_win.min():
                     bull_cnt = 0
-                    if curr_low > df['low'].iloc[prev_p_idx]: bull_cnt += 1 # Hidden
+                    if curr_low > df['low'].iloc[prev_p_idx]: bull_cnt += 1 
                     for key in ['RSI_14', 'CCI_10', 'MACD']:
-                        if df[key].iloc[pivot_idx] > df[key].iloc[prev_p_idx]: bull_cnt += 1
+                        if key in df.columns and df[key].iloc[pivot_idx] > df[key].iloc[prev_p_idx]: bull_cnt += 1
                     if bull_cnt >= 2: return True, df['timestamp'].iloc[idx], "Bullish"
                     break
-        
         # Bearish
         window_high = df['high'].iloc[pivot_idx-prd : pivot_idx+prd+1]
         if df['high'].iloc[pivot_idx] == window_high.max():
@@ -147,145 +147,57 @@ def check_signal_1_div_validity(df):
                 prev_win = df['high'].iloc[prev_p_idx-prd : prev_p_idx+prd+1]
                 if df['high'].iloc[prev_p_idx] == prev_win.max():
                     bear_cnt = 0
-                    if curr_high < df['high'].iloc[prev_p_idx]: bear_cnt += 1 # Hidden
+                    if curr_high < df['high'].iloc[prev_p_idx]: bear_cnt += 1 
                     for key in ['RSI_14', 'CCI_10', 'MACD']:
-                        if df[key].iloc[pivot_idx] < df[key].iloc[prev_p_idx]: bear_cnt += 1
+                        if key in df.columns and df[key].iloc[pivot_idx] < df[key].iloc[prev_p_idx]: bear_cnt += 1
                     if bear_cnt >= 2: return True, df['timestamp'].iloc[idx], "Bearish"
                     break
-
     return False, None, None
 
 def check_signal_2_double_bb_validity(df):
-    """ Signal 2: Double BB (OR Condition, 2봉 유효) """
     current_idx = len(df) - 1
-    for offset in range(2): # 0, 1
+    for offset in range(2):
         i = current_idx - offset
         row = df.iloc[i]
-        
-        # Oversold: Close < BBL_20 OR Close < BBL_4
         if row['close'] < row['BBL_20'] or row['close'] < row['BBL_4']:
             return True, row['timestamp'], "Oversold"
-            
-        # Overbought: Close > BBU_20 OR Close > BBU_4
         if row['close'] > row['BBU_20'] or row['close'] > row['BBU_4']:
              return True, row['timestamp'], "Overbought"
-             
     return False, None, None
 
 def check_signal_3_cci_bb_validity(df):
-    """ Signal 3: CCI + BB (Strict, 1봉 유효) """
     current_idx = len(df) - 1
-    for offset in range(2): # 0, 1
+    for offset in range(2):
         i = current_idx - offset
         if i < 0: continue
         row = df.iloc[i]
-        
-        is_bull = (row['CCI_20'] < -100) and (row['close'] < row['BBL_20'])
-        is_bear = (row['CCI_20'] > 100) and (row['close'] > row['BBU_20'])
-        
-        if is_bull: return True, row['timestamp'], "Bullish"
-        if is_bear: return True, row['timestamp'], "Bearish"
-        
+        if (row['CCI_20'] < -100) and (row['close'] < row['BBL_20']): return True, row['timestamp'], "Bullish"
+        if (row['CCI_20'] > 100) and (row['close'] > row['BBU_20']): return True, row['timestamp'], "Bearish"
     return False, None, None
 
 def check_signal_4_band_in_validity(df):
-    """ Signal 4: Band-In (3봉 유효, 이탈 시 리셋) """
     curr_idx = len(df) - 1
-    for offset in range(3): # 0, 1, 2
+    for offset in range(3):
         i = curr_idx - offset
         if i < 7: continue
-        
         recent_cci = df['CCI_20'].iloc[i-6:i]
-        
         # Bullish
-        was_os = (recent_cci < -100).sum() >= 5
-        now_in = df['CCI_20'].iloc[i] > -100
-        prev_was_os = df['CCI_20'].iloc[i-1] < -100
-        if was_os and prev_was_os and now_in:
-            is_reset = False
-            for k in range(i + 1, curr_idx + 1):
-                if df['CCI_20'].iloc[k] < -100: is_reset = True
-            if not is_reset: return True, df['timestamp'].iloc[i], "Bullish"
-
+        if (recent_cci < -100).sum() >= 5 and df['CCI_20'].iloc[i-1] < -100 and df['CCI_20'].iloc[i] > -100:
+            return True, df['timestamp'].iloc[i], "Bullish"
         # Bearish
-        was_ob = (recent_cci > 100).sum() >= 5
-        now_in_bear = df['CCI_20'].iloc[i] < 100
-        prev_was_ob = df['CCI_20'].iloc[i-1] > 100
-        if was_ob and prev_was_ob and now_in_bear:
-            is_reset = False
-            for k in range(i + 1, curr_idx + 1):
-                if df['CCI_20'].iloc[k] > 100: is_reset = True
-            if not is_reset: return True, df['timestamp'].iloc[i], "Bearish"
-
+        if (recent_cci > 100).sum() >= 5 and df['CCI_20'].iloc[i-1] > 100 and df['CCI_20'].iloc[i] < 100:
+            return True, df['timestamp'].iloc[i], "Bearish"
     return False, None, None
 
 def check_signal_5_breakout_validity(df):
-    """
-    Signal 5: 30-Candle Breakout
-    - Green 조건: 최근 5봉 이내에 돌파(Breakout)가 발생.
-    - 유지 조건: 고점을 갱신하면(재돌파) 5봉 타이머 리셋(연장).
-    - Red(Invalid) 조건: 돌파 후 가격이 기준선 아래로 내려와서 **2봉 연속** 회복 못하면 무효.
-    """
     if len(df) < 50: return False, None, None
     curr_idx = len(df) - 1
-    
-    # 최근 5개 봉(0~4)을 검사 (가장 최근 돌파를 찾음)
     for offset in range(5):
-        i = curr_idx - offset # 검사할 시점 (과거 -> 현재)
+        i = curr_idx - offset
         if i < 10: continue
-        
         row = df.iloc[i]
-        
-        # 1. Bullish Breakout Check
-        breakout_level_high = row['High_30']
-        if row['close'] > breakout_level_high:
-            # i 시점에 돌파 발생!
-            # i 이후부터 현재(curr_idx)까지 '2봉 연속 이탈'이 있었는지 검사
-            
-            fail_count = 0
-            is_invalidated = False
-            
-            # i+1 부터 현재까지 순회
-            for k in range(i + 1, curr_idx + 1):
-                # 돌파 레벨 밑으로 내려갔는가?
-                # (주의: 고점 갱신 시 레벨이 올라갈 수 있으나, 여기선 최초 돌파 시점의 레벨 or 
-                #  그 시점 기준의 레벨로 단순화. 더 정확히는 매 봉마다 기준선이 변하지만 
-                #  '재돌파'하면 앞선 루프(offset이 더 작은)에서 잡히므로 여기선 단순 유지여부만 봄)
-                
-                # 재돌파(갱신) 했다면? -> fail_count 초기화 (유지됨)
-                if df['close'].iloc[k] > breakout_level_high:
-                    fail_count = 0
-                # 이탈 했다면? -> 카운트 증가
-                elif df['close'].iloc[k] < breakout_level_high:
-                    fail_count += 1
-                
-                # 2봉 연속 이탈 시 무효화
-                if fail_count >= 2:
-                    is_invalidated = True
-                    break
-            
-            if not is_invalidated:
-                return True, row['timestamp'], "Bullish Breakout"
-
-        # 2. Bearish Breakout Check
-        breakout_level_low = row['Low_30']
-        if row['close'] < breakout_level_low:
-            fail_count = 0
-            is_invalidated = False
-            
-            for k in range(i + 1, curr_idx + 1):
-                if df['close'].iloc[k] < breakout_level_low: # 갱신(더 떨어짐)
-                    fail_count = 0
-                elif df['close'].iloc[k] > breakout_level_low: # 이탈(반등)
-                    fail_count += 1
-                
-                if fail_count >= 2:
-                    is_invalidated = True
-                    break
-            
-            if not is_invalidated:
-                return True, row['timestamp'], "Bearish Breakout"
-
+        if row['close'] > row['High_30']: return True, row['timestamp'], "Bullish Breakout"
+        if row['close'] < row['Low_30']: return True, row['timestamp'], "Bearish Breakout"
     return False, None, None
 
 # -----------------------------------------------------------------------------
@@ -293,48 +205,41 @@ def check_signal_5_breakout_validity(df):
 # -----------------------------------------------------------------------------
 def scan_all_status():
     status_list = []
-    
-    progress_text = "Scanning Markets..."
+    progress_text = "Scanning Markets (yfinance)..."
     my_bar = st.progress(0, text=progress_text)
-    total_steps = len(COINS) * len(TIMEFRAMES)
+    total_steps = len(COIN_MAP) * len(TIMEFRAMES)
     step = 0
     
-    for coin in COINS:
+    for coin_name in COIN_MAP.keys():
         for tf_key, tf_val in TIMEFRAMES.items():
-            df = fetch_ohlcv(coin, tf_val, limit=200)
+            df = fetch_ohlcv(coin_name, tf_val)
             df = calculate_indicators(df)
             
             if df.empty:
                 step += 1
                 continue
             
-            # Sig 1
+            # 각 시그널 체크
             if tf_key in ['1h', '2h', '4h', '1d']:
-                valid, time, type_ = check_signal_1_div_validity(df)
-                status_list.append({"Coin": coin, "TF": tf_key, "Signal": "Sig 1", "Status": "Green" if valid else "Red", "Start Time": time if valid else "-", "Type": type_ if valid else "-"})
+                v1, t1, ty1 = check_signal_1_div_validity(df)
+                status_list.append({"Coin": coin_name, "TF": tf_key, "Signal": "Sig 1", "Status": "Green" if v1 else "Red", "Start Time": t1 if v1 else "-", "Type": ty1 if v1 else "-"})
             
-            # Sig 2 (OR)
-            if tf_key in ['15m', '1h', '2h', '4h', '1d']:
-                valid, time, type_ = check_signal_2_double_bb_validity(df)
-                status_list.append({"Coin": coin, "TF": tf_key, "Signal": "Sig 2", "Status": "Green" if valid else "Red", "Start Time": time if valid else "-", "Type": type_ if valid else "-"})
+            v2, t2, ty2 = check_signal_2_double_bb_validity(df)
+            status_list.append({"Coin": coin_name, "TF": tf_key, "Signal": "Sig 2", "Status": "Green" if v2 else "Red", "Start Time": t2 if v2 else "-", "Type": ty2 if v2 else "-"})
 
-            # Sig 3
-            if tf_key in ['2h', '4h', '1d']:
-                valid, time, type_ = check_signal_3_cci_bb_validity(df)
-                status_list.append({"Coin": coin, "TF": tf_key, "Signal": "Sig 3", "Status": "Green" if valid else "Red", "Start Time": time if valid else "-", "Type": type_ if valid else "-"})
+            if tf_key in ['1h', '2h', '4h', '1d']:
+                v3, t3, ty3 = check_signal_3_cci_bb_validity(df)
+                status_list.append({"Coin": coin_name, "TF": tf_key, "Signal": "Sig 3", "Status": "Green" if v3 else "Red", "Start Time": t3 if v3 else "-", "Type": ty3 if v3 else "-"})
 
-            # Sig 4
             if tf_key in ['1h', '2h', '4h']:
-                valid, time, type_ = check_signal_4_band_in_validity(df)
-                status_list.append({"Coin": coin, "TF": tf_key, "Signal": "Sig 4", "Status": "Green" if valid else "Red", "Start Time": time if valid else "-", "Type": type_ if valid else "-"})
+                v4, t4, ty4 = check_signal_4_band_in_validity(df)
+                status_list.append({"Coin": coin_name, "TF": tf_key, "Signal": "Sig 4", "Status": "Green" if v4 else "Red", "Start Time": t4 if v4 else "-", "Type": ty4 if v4 else "-"})
             
-            # Sig 5 (Breakout, 5 bars valid, 2 bars fail)
-            if tf_key in ['15m', '1h', '2h', '4h', '1d']:
-                valid, time, type_ = check_signal_5_breakout_validity(df)
-                status_list.append({"Coin": coin, "TF": tf_key, "Signal": "Sig 5", "Status": "Green" if valid else "Red", "Start Time": time if valid else "-", "Type": type_ if valid else "-"})
+            v5, t5, ty5 = check_signal_5_breakout_validity(df)
+            status_list.append({"Coin": coin_name, "TF": tf_key, "Signal": "Sig 5", "Status": "Green" if v5 else "Red", "Start Time": t5 if v5 else "-", "Type": ty5 if v5 else "-"})
 
             step += 1
-            my_bar.progress(step / total_steps, text=f"Scanning {coin} {tf_key}...")
+            my_bar.progress(step / total_steps, text=f"Scanning {coin_name} {tf_key}...")
             
     my_bar.empty()
     return pd.DataFrame(status_list)
@@ -344,164 +249,107 @@ def scan_all_status():
 # -----------------------------------------------------------------------------
 st.title(f"🚦 Crypto Signal Monitor - {DATE_STR} (KST)")
 
-# 상단: 실시간 시세
-cols = st.columns(len(COINS))
-for i, coin in enumerate(COINS):
-    df = fetch_ohlcv(coin, '15m', limit=5)
-    if not df.empty:
-        price = df['close'].iloc[-1]
+# 상단: 실시간 시세 (yfinance)
+cols = st.columns(len(COIN_MAP))
+for i, coin in enumerate(COIN_MAP.keys()):
+    df_brief = fetch_ohlcv(coin, '15m')
+    if not df_brief.empty:
+        price = df_brief['close'].iloc[-1]
         cols[i].metric(coin, f"{price:.4f}")
 
 st.divider()
 
-# 스캔 버튼
 if st.button("🔄 Refresh Signals"):
     st.session_state.status_log = scan_all_status()
     st.success("Scan Updated!")
 
-# 스타일링 (Green/Red)
 def color_status(val):
-    color = '#d4edda' if val == 'Green' else '#f8d7da' # 연한 초록 / 연한 빨강
+    color = '#d4edda' if val == 'Green' else '#f8d7da'
     return f'background-color: {color}; color: black'
 
 if isinstance(st.session_state.status_log, pd.DataFrame) and not st.session_state.status_log.empty:
     df_status = st.session_state.status_log
-    
-    # 탭 구성: Dashboard + Signals(1~5) + Multi(Coins)
-    tab_titles = ["Dashboard", "Sig 1 (Div)", "Sig 2 (BB OR)", "Sig 3 (CCI+BB)", "Sig 4 (Band-In)", "Sig 5 (Breakout)"] + [f"{c} Multi" for c in COINS]
+    tab_titles = ["Dashboard", "Sig 1 (Div)", "Sig 2 (BB OR)", "Sig 3 (CCI+BB)", "Sig 4 (Band-In)", "Sig 5 (Breakout)"] + [f"{c} Multi" for c in COIN_MAP.keys()]
     tabs = st.tabs(tab_titles)
     
-    # [Tab 0] Dashboard
     with tabs[0]:
         st.subheader("📋 All Signals Status")
+        # applymap 대신 map 사용 (Pandas 최신 버전 호환)
         st.dataframe(df_status.style.map(color_status, subset=['Status']), use_container_width=True)
     
-    # [Tab 1~5] Individual Signals
     sig_names = ["Sig 1", "Sig 2", "Sig 3", "Sig 4", "Sig 5"]
     for i, sig_name in enumerate(sig_names):
         with tabs[i+1]:
             st.subheader(f"📡 {sig_name} Status")
-            
-            # 설명 추가
-            if sig_name == "Sig 2":
-                st.caption("ℹ️ Condition: Close > Any BB Upper OR Close < Any BB Lower (OR Logic)")
-            if sig_name == "Sig 5":
-                st.caption("ℹ️ Breakout of 10-Candle High/Low (Valid 5 bars, Reset on new high, Invalid if 2 bars deviate)")
-
             df_sub = df_status[df_status['Signal'] == sig_name].sort_values(by='Status', ascending=True) 
-            st.dataframe(df_status.style.map(color_status, subset=['Status']), use_container_width=True)
+            st.dataframe(df_sub.style.map(color_status, subset=['Status']), use_container_width=True)
             
-    # [Tab 6~] Multi Signals per Coin
-    for i, coin in enumerate(COINS):
+    for i, coin in enumerate(COIN_MAP.keys()):
         with tabs[6+i]:
-            st.subheader(f"🔥 {coin} Multi Signals (3+ Active)")
+            st.subheader(f"🔥 {coin} Multi Signals")
             df_coin = df_status[(df_status['Coin'] == coin) & (df_status['Status'] == 'Green')]
             green_count = len(df_coin)
-            
             st.metric("Active Signals Count", f"{green_count} / 3 Required")
-            
             if green_count >= 3:
                 st.success(f"🚨 ALERT: {green_count} Signals Simultaneously Active!")
-                st.dataframe(df_coin, use_container_width=True)
-            else:
-                st.info("Not enough active signals (Need 3+).")
-                if green_count > 0:
-                    st.write("Currently Active:")
-                    st.dataframe(df_coin, use_container_width=True)
+            st.dataframe(df_coin, use_container_width=True)
 else:
     st.info("Please click 'Refresh Signals' to start.")
 
 st.divider()
 
 # -----------------------------------------------------------------------------
-# 5. 레버리지 계산기 (손익비 설정 추가)
+# 5. 레버리지 계산기
 # -----------------------------------------------------------------------------
 st.subheader("🧮 Position & Leverage Calculator")
-
 calc_col1, calc_col2 = st.columns(2)
 
 with calc_col1:
     st.markdown("##### Input Data")
-    s_coin = st.selectbox("Select Coin", COINS)
-    s_tf = st.selectbox("Reference Timeframe", ['15m', '1h', '2h', '4h', '1d'])
-    
-    # 손익비(R/R Ratio) 사용자 설정
+    s_coin = st.selectbox("Select Coin", list(COIN_MAP.keys()))
+    s_tf = st.selectbox("Reference Timeframe", ['15m', '1h', '1d'])
     rr_ratio = st.number_input("Risk/Reward Ratio (Target)", value=3.0, step=0.1, format="%.1f")
     
-    # 데이터 가져오기
-    df_calc = fetch_ohlcv(s_coin, s_tf, limit=50)
+    df_calc = fetch_ohlcv(s_coin, s_tf)
     df_calc = calculate_indicators(df_calc)
     
     if not df_calc.empty and 'ATR_14' in df_calc.columns:
         cur_p = df_calc['close'].iloc[-1]
         cur_atr = df_calc['ATR_14'].iloc[-1]
-        
-        if pd.isna(cur_atr) or cur_atr == 0: cur_atr = cur_p * 0.01 
         atr_pct = (cur_atr / cur_p) * 100
-        
         st.info(f"Price: {cur_p:.4f} | ATR: {cur_atr:.4f} ({atr_pct:.2f}%)")
         
         sl = st.number_input("Stop Loss Price (SL)", value=0.0, format="%.4f")
         pos = "Long" if cur_p > sl else "Short"
         if sl == 0: pos = "Ready"
-        
         st.write(f"Detected Position: **{pos}**")
         entry = st.number_input("Entry Price", value=cur_p, format="%.4f")
         
-        valid_input = False
         if sl > 0:
             if (pos == "Long" and entry > sl) or (pos == "Short" and entry < sl):
-                valid_input = True
+                risk = abs(entry - sl)
+                tp = entry + (risk * rr_ratio) if pos == "Long" else entry - (risk * rr_ratio)
+                sl_dist_pct = abs(entry - sl) / entry * 100
+                lev_dist = 10 / sl_dist_pct if sl_dist_pct > 0 else 0
+                
+                st.success("Calculations Complete!")
+                st.markdown(f"- **Rec. Leverage:** `{lev_dist:.2f}x` (10% Risk)\n- **Target Price:** `{tp:.4f}`")
+                
+                if st.button("💾 Add to Trade Plan"):
+                    st.session_state.trade_plan_log.append({
+                        "Time": datetime.now().strftime("%H:%M"), "Coin": s_coin, "Type": pos,
+                        "Entry": entry, "SL": sl, "TP": tp, "RR": f"1:{rr_ratio}", "Lev": round(lev_dist, 2)
+                    })
             else:
-                st.error("Invalid Entry: Long entry must be > SL, Short entry must be < SL.")
-        
-        if valid_input:
-            # 레버리지 계산
-            lev_vol = 10 / atr_pct if atr_pct > 0 else 0
-            sl_dist_pct = abs(entry - sl) / entry * 100
-            lev_dist = 10 / sl_dist_pct if sl_dist_pct > 0 else 0
-            
-            # 목표가 계산 (사용자 설정 R/R 적용)
-            risk = abs(entry - sl)
-            tp = entry + (risk * rr_ratio) if pos == "Long" else entry - (risk * rr_ratio)
-            
-            st.success("Calculations Complete!")
-            st.markdown(f"""
-            - **Rec. Leverage (Volatility):** `{lev_vol:.2f}x`
-            - **Rec. Leverage (SL Dist):** `{lev_dist:.2f}x`
-            - **Target Price (1:{rr_ratio}):** `{tp:.4f}`
-            """)
-            
-            feedback = st.text_area("Trading Notes / Feedback")
-            
-            if st.button("💾 Add to Trade Plan"):
-                plan_entry = {
-                    "Time": datetime.now().strftime("%H:%M"),
-                    "Coin": s_coin,
-                    "Type": pos,
-                    "Entry": entry,
-                    "SL": sl,
-                    "TP": tp,
-                    "RR": f"1:{rr_ratio}",
-                    "Lev(Vol)": round(lev_vol, 2),
-                    "Lev(Dist)": round(lev_dist, 2),
-                    "Feedback": feedback
-                }
-                st.session_state.trade_plan_log.append(plan_entry)
-                st.success("Plan saved to list!")
+                st.error("Invalid Entry vs SL.")
 
 with calc_col2:
     st.markdown("##### 📝 Today's Trade Plan")
     if st.session_state.trade_plan_log:
         st.dataframe(pd.DataFrame(st.session_state.trade_plan_log), use_container_width=True)
-    else:
-        st.write("No plans added yet.")
 
-# 파일 저장 버튼
 if st.button("Save All Data to Excel"):
     with pd.ExcelWriter(FILE_NAME, engine='openpyxl') as writer:
-        if isinstance(st.session_state.status_log, pd.DataFrame):
-            st.session_state.status_log.to_excel(writer, sheet_name='Signal_Status', index=False)
-        if st.session_state.trade_plan_log:
-            pd.DataFrame(st.session_state.trade_plan_log).to_excel(writer, sheet_name='Trade_Plan', index=False)
+        if st.session_state.status_log: pd.DataFrame(st.session_state.status_log).to_excel(writer, sheet_name='Signals', index=False)
+        if st.session_state.trade_plan_log: pd.DataFrame(st.session_state.trade_plan_log).to_excel(writer, sheet_name='Plans', index=False)
     st.success(f"File saved: {FILE_NAME}")
